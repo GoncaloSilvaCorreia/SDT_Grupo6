@@ -19,6 +19,7 @@ public class Libp2pPeer {
     private static String localIp;
     
     // Document CID vector management
+    private static final Object versionLock = new Object();
     private static List<String> currentDocumentCIDs = new ArrayList<>();
     private static List<String> pendingDocumentCIDs = null;
     private static int currentVersion = 0;
@@ -211,7 +212,7 @@ public class Libp2pPeer {
                 System.out.println("[" + peerId.toUpperCase() + "] Prepare: recebido CID=" + cid + " versao=" + incomingVersion);
                 
                 // Criar nova versão do vetor de CIDs (sem substituir a atual)
-                synchronized (Libp2pPeer.class) {
+                synchronized (versionLock) {
                     pendingDocumentCIDs = new ArrayList<>(currentDocumentCIDs);
                     pendingDocumentCIDs.add(cid);
                     pendingVersion = incomingVersion;
@@ -255,7 +256,7 @@ public class Libp2pPeer {
 
             try {
                 // Substituir a versão atual pela versão pendente
-                synchronized (Libp2pPeer.class) {
+                synchronized (versionLock) {
                     if (pendingDocumentCIDs != null) {
                         currentDocumentCIDs = pendingDocumentCIDs;
                         currentVersion = pendingVersion;
@@ -307,19 +308,21 @@ public class Libp2pPeer {
      */
     private static String extractJsonField(String json, String fieldName) {
         if (json == null) return null;
-        String pattern = "\"" + fieldName + "\"\\s*:\\s*\"([^\"]+)\"";
-        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern);
-        java.util.regex.Matcher m = p.matcher(json);
+        
+        // Try with quotes first (for strings)
+        String quotedPattern = "\"" + fieldName + "\"\\s*:\\s*\"([^\"]+)\"";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(quotedPattern).matcher(json);
         if (m.find()) {
             return m.group(1);
         }
+        
         // Try without quotes (for numbers)
-        pattern = "\"" + fieldName + "\"\\s*:\\s*([^,}\\s]+)";
-        p = java.util.regex.Pattern.compile(pattern);
-        m = p.matcher(json);
+        String unquotedPattern = "\"" + fieldName + "\"\\s*:\\s*([^,}\\s]+)";
+        m = java.util.regex.Pattern.compile(unquotedPattern).matcher(json);
         if (m.find()) {
             return m.group(1);
         }
+        
         return null;
     }
     

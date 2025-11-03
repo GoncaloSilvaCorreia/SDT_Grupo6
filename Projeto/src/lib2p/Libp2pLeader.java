@@ -252,7 +252,7 @@ public class Libp2pLeader {
                 int prepareSuccess = 0;
                 
                 for (String peerId : peerIds) {
-                    String hash = sendPrepareToePeer(peerId, cid, version, body);
+                    String hash = sendPrepareToPeer(peerId, cid, version, body);
                     if (hash != null) {
                         peerHashes.put(peerId, hash);
                         prepareSuccess++;
@@ -306,7 +306,7 @@ public class Libp2pLeader {
     /**
      * Envia prepare para um peer e retorna o hash ou null se falhar
      */
-    private static String sendPrepareToePeer(String peerId, String cid, int version, String fullBody) {
+    private static String sendPrepareToPeer(String peerId, String cid, int version, String fullBody) {
         try {
             String addr = peerAddressMap.get(peerId);
             if (addr == null || addr.trim().isEmpty()) {
@@ -456,19 +456,21 @@ public class Libp2pLeader {
      */
     private static String extractJsonField(String json, String fieldName) {
         if (json == null) return null;
-        String pattern = "\"" + fieldName + "\"\\s*:\\s*\"([^\"]+)\"";
-        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern);
-        java.util.regex.Matcher m = p.matcher(json);
+        
+        // Try with quotes first (for strings)
+        String quotedPattern = "\"" + fieldName + "\"\\s*:\\s*\"([^\"]+)\"";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(quotedPattern).matcher(json);
         if (m.find()) {
             return m.group(1);
         }
+        
         // Try without quotes (for numbers)
-        pattern = "\"" + fieldName + "\"\\s*:\\s*([^,}\\s]+)";
-        p = java.util.regex.Pattern.compile(pattern);
-        m = p.matcher(json);
+        String unquotedPattern = "\"" + fieldName + "\"\\s*:\\s*([^,}\\s]+)";
+        m = java.util.regex.Pattern.compile(unquotedPattern).matcher(json);
         if (m.find()) {
             return m.group(1);
         }
+        
         return null;
     }
 
