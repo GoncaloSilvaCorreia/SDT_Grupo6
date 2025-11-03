@@ -6,7 +6,10 @@ import com.sun.net.httpserver.HttpHandler;
 
 import java.io.*;
 import java.net.*;
+import java.security.MessageDigest;
+import java.util.*;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Libp2pPeer {
 
@@ -14,6 +17,15 @@ public class Libp2pPeer {
     private static Libp2pNode peerNode;
     private static int peerPort;
     private static String localIp;
+    
+    // Document CID vector management
+    private static List<String> currentDocumentCIDs = new ArrayList<>();
+    private static List<String> pendingDocumentCIDs = null;
+    private static int currentVersion = 0;
+    private static int pendingVersion = 0;
+    
+    // Temporary storage for embeddings
+    private static Map<String, Object> pendingEmbeddings = new ConcurrentHashMap<>();
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
@@ -58,6 +70,12 @@ public class Libp2pPeer {
 
         // Endpoint para receber mensagens do líder
         server.createContext("/api/messages/receive", new ReceiveMessageHandler());
+        
+        // Endpoint para prepare phase (receber novo CID)
+        server.createContext("/api/document/prepare", new PrepareDocumentHandler());
+        
+        // Endpoint para commit phase (confirmar nova versão)
+        server.createContext("/api/document/commit", new CommitDocumentHandler());
 
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
@@ -152,26 +170,180 @@ public class Libp2pPeer {
                 sendResponse(exchange, 405, "{\"error\": \"Metodo nao permitido\"}");
             }
         }
+    }
 
-        private String readRequestBody(HttpExchange exchange) throws IOException {
-            InputStream is = exchange.getRequestBody();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line);
+    /**
+     * Handler para prepare phase - receber novo CID do documento
+     */
+    static class PrepareDocumentHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "{\"error\": \"Metodo nao permitido\"}");
+                return;
             }
-            return sb.toString();
-        }
 
-        private void sendResponse(HttpExchange exchange, int statusCode, String response)
-                throws IOException {
-            byte[] bytes = response.getBytes("UTF-8");
-            exchange.sendResponseHeaders(statusCode, bytes.length);
-            OutputStream os = exchange.getResponseBody();
-            os.write(bytes);
-            os.close();
+            try {
+                String body = readRequestBody(exchange);
+                
+                // Parse JSON simples: {"cid": "...", "version": 1, "embeddings": {...}}
+                String cid = extractJsonField(body, "cid");
+                String versionStr = extractJsonField(body, "version");
+                String embeddingsJson = extractJsonField(body, "embeddings");
+                
+                if (cid == null || cid.isEmpty()) {
+                    sendResponse(exchange, 400, "{\"error\": \"CID vazio\"}");
+                    return;
+                }
+                
+                int incomingVersion = versionStr != null ? Integer.parseInt(versionStr) : currentVersion + 1;
+                
+                // Verificar conflito de versões
+                if (pendingDocumentCIDs != null) {
+                    System.err.println("[" + peerId.toUpperCase() + "] CONFLITO: versão pendente já existe!");
+                    sendResponse(exchange, 409, "{\"error\": \"Conflito de versao - resolucao futura\"}");
+                    return;
+                }
+                
+                System.out.println("[" + peerId.toUpperCase() + "] Prepare: recebido CID=" + cid + " versao=" + incomingVersion);
+                
+                // Criar nova versão do vetor de CIDs (sem substituir a atual)
+                synchronized (Libp2pPeer.class) {
+                    pendingDocumentCIDs = new ArrayList<>(currentDocumentCIDs);
+                    pendingDocumentCIDs.add(cid);
+                    pendingVersion = incomingVersion;
+                }
+                
+                // Armazenar embeddings temporariamente
+                if (embeddingsJson != null && !embeddingsJson.isEmpty()) {
+                    pendingEmbeddings.put(cid, embeddingsJson);
+                    System.out.println("[" + peerId.toUpperCase() + "] Embeddings armazenados temporariamente para CID=" + cid);
+                }
+                
+                // Calcular hash do vetor de CIDs pendente
+                String hash = calculateHash(pendingDocumentCIDs);
+                
+                System.out.println("[" + peerId.toUpperCase() + "] Hash calculado: " + hash);
+                
+                String response = "{\"status\": \"prepared\", \"hash\": \"" + hash + "\", \"version\": " + pendingVersion + "}";
+                sendResponse(exchange, 200, response);
+                
+            } catch (Exception e) {
+                System.err.println("[" + peerId.toUpperCase() + "] Erro no prepare: " + e.getMessage());
+                e.printStackTrace();
+                sendResponse(exchange, 500, "{\"error\": \"" + e.getMessage() + "\"}");
+            }
         }
+    }
+    
+    /**
+     * Handler para commit phase - confirmar nova versão
+     */
+    static class CommitDocumentHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "{\"error\": \"Metodo nao permitido\"}");
+                return;
+            }
+
+            try {
+                // Substituir a versão atual pela versão pendente
+                synchronized (Libp2pPeer.class) {
+                    if (pendingDocumentCIDs != null) {
+                        currentDocumentCIDs = pendingDocumentCIDs;
+                        currentVersion = pendingVersion;
+                        pendingDocumentCIDs = null;
+                        pendingVersion = 0;
+                        
+                        System.out.println("[" + peerId.toUpperCase() + "] COMMIT: Nova versão confirmada v" + currentVersion);
+                        System.out.println("[" + peerId.toUpperCase() + "] CIDs atuais: " + currentDocumentCIDs);
+                        
+                        // Nota: embeddings podem ser indexados no FAISS aqui no futuro
+                        if (!pendingEmbeddings.isEmpty()) {
+                            System.out.println("[" + peerId.toUpperCase() + "] Embeddings prontos para indexação FAISS (futuro)");
+                            // Manter embeddings para futura indexação
+                        }
+                    } else {
+                        System.err.println("[" + peerId.toUpperCase() + "] COMMIT: Nenhuma versão pendente para confirmar!");
+                    }
+                }
+                
+                String response = "{\"status\": \"committed\", \"version\": " + currentVersion + "}";
+                sendResponse(exchange, 200, response);
+                
+            } catch (Exception e) {
+                System.err.println("[" + peerId.toUpperCase() + "] Erro no commit: " + e.getMessage());
+                e.printStackTrace();
+                sendResponse(exchange, 500, "{\"error\": \"" + e.getMessage() + "\"}");
+            }
+        }
+    }
+    
+    /**
+     * Calcula hash SHA-256 de uma lista de CIDs
+     */
+    private static String calculateHash(List<String> cids) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        String concatenated = String.join(",", cids);
+        byte[] hashBytes = digest.digest(concatenated.getBytes("UTF-8"));
+        
+        // Converter para hexadecimal
+        StringBuilder sb = new StringBuilder();
+        for (byte b : hashBytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+    
+    /**
+     * Extrai um campo simples de um JSON (parsing básico)
+     */
+    private static String extractJsonField(String json, String fieldName) {
+        if (json == null) return null;
+        String pattern = "\"" + fieldName + "\"\\s*:\\s*\"([^\"]+)\"";
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern);
+        java.util.regex.Matcher m = p.matcher(json);
+        if (m.find()) {
+            return m.group(1);
+        }
+        // Try without quotes (for numbers)
+        pattern = "\"" + fieldName + "\"\\s*:\\s*([^,}\\s]+)";
+        p = java.util.regex.Pattern.compile(pattern);
+        m = p.matcher(json);
+        if (m.find()) {
+            return m.group(1);
+        }
+        return null;
+    }
+    
+    /**
+     * Utility methods for handlers
+     */
+    private static String readRequestBody(HttpExchange exchange) throws IOException {
+        InputStream is = exchange.getRequestBody();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            sb.append(line);
+        }
+        return sb.toString();
+    }
+    
+    private static void sendResponse(HttpExchange exchange, int statusCode, String response)
+            throws IOException {
+        byte[] bytes = response.getBytes("UTF-8");
+        exchange.sendResponseHeaders(statusCode, bytes.length);
+        OutputStream os = exchange.getResponseBody();
+        os.write(bytes);
+        os.close();
     }
 
     /**
