@@ -6,7 +6,12 @@ import com.sun.net.httpserver.HttpHandler;
 
 import java.io.*;
 import java.net.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Libp2pPeer {
 
@@ -14,6 +19,14 @@ public class Libp2pPeer {
     private static Libp2pNode peerNode;
     private static int peerPort;
     private static String localIp;
+
+    // Vetor de CIDs de documentos e sua versão
+    private static final List<String> documentCidVector = new ArrayList<>();
+    private static final AtomicInteger documentVectorVersion = new AtomicInteger(0);
+
+    // Armazenamento de embeddings por CID (string genérica: JSON, base64, etc.)
+    private static final Map<String, String> documentEmbeddings = new ConcurrentHashMap<>();
+
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
@@ -98,7 +111,7 @@ public class Libp2pPeer {
             URL url = new URL(leaderUrl);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "text/plain");
+            conn.setRequestProperty("Content-Type", "text/plain; charset=UTF-8");
             conn.setDoOutput(true);
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
@@ -111,13 +124,22 @@ public class Libp2pPeer {
             }
 
             int responseCode = conn.getResponseCode();
-            conn.disconnect();
-
             if (responseCode == 200) {
                 System.out.println("Registado no lider com sucesso!");
             } else {
                 System.err.println("Erro ao registar no líder (código: " + responseCode + ")");
+                // Optional: read error stream from connection
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getErrorStream(), "utf-8"))) {
+                    StringBuilder response = new StringBuilder();
+                    String responseLine;
+                    while ((responseLine = br.readLine()) != null) {
+                        response.append(responseLine.trim());
+                    }
+                    System.err.println("Resposta do lider: " + response.toString());
+                }
             }
+            conn.disconnect();
+
         } catch (Exception e) {
             System.err.println("Erro ao registar no lider: " + e.getMessage());
         }
@@ -130,7 +152,7 @@ public class Libp2pPeer {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
-            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.getResponseHeaders().add("Content-Type", "text/plain");
 
             if ("POST".equals(exchange.getRequestMethod())) {
                 try {
@@ -139,17 +161,78 @@ public class Libp2pPeer {
                     if (message != null && !message.isEmpty()) {
                         System.out.println("[" + peerId.toUpperCase() + "] Mensagem recebida:");
                         System.out.println("   " + message + "\n");
+
+                        // Processar a atualização do documento
+                        handleDocumentUpdate(message);
                     }
 
-                    String response = "{\"status\": \"Mensagem recebida\"}";
+                    String response = "Mensagem recebida";
                     sendResponse(exchange, 200, response);
 
                 } catch (Exception e) {
-                    System.err.println("Erro: " + e.getMessage());
-                    sendResponse(exchange, 500, "{\"error\": \"" + e.getMessage() + "\"}");
+                    System.err.println("Erro ao processar mensagem: " + e.getMessage());
+                    e.printStackTrace();
+                    sendResponse(exchange, 500, "Erro: " + e.getMessage());
                 }
             } else {
-                sendResponse(exchange, 405, "{\"error\": \"Metodo nao permitido\"}");
+                sendResponse(exchange, 405, "Metodo nao permitido");
+            }
+        }
+
+        private void handleDocumentUpdate(String message) {
+            try {
+                // Suporta: "versao;cid" ou "versao;cid;embedding..."
+                String[] parts = message.split(";");
+                if (parts.length < 2) {
+                    System.err.println("Formato da mensagem de atualização inválido: " + message);
+                    return;
+                }
+
+                int receivedVersion;
+                try {
+                    receivedVersion = Integer.parseInt(parts[0]);
+                } catch (NumberFormatException nfe) {
+                    System.err.println("Versão inválida na mensagem: " + parts[0]);
+                    return;
+                }
+
+                String cid = parts[1];
+
+                // Se houver mais de 2 partes, junta o resto como string de embedding (para permitir ';' no conteúdo)
+                String embedding = null;
+                if (parts.length > 2) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 2; i < parts.length; i++) {
+                        if (i > 2) sb.append(";");
+                        sb.append(parts[i]);
+                    }
+                    embedding = sb.toString().trim();
+                }
+
+                System.out.println("Atualização de documento processada: Versão=" + receivedVersion + ", CID=" + cid + (embedding != null ? ", embedding recebido" : ", sem embedding"));
+
+                // Lógica de atualização do vetor local
+                synchronized (documentCidVector) {
+                    if (receivedVersion > documentVectorVersion.get()) {
+                        if (!documentCidVector.contains(cid)) {
+                            documentCidVector.add(cid);
+                        }
+                        documentVectorVersion.set(receivedVersion);
+                        System.out.println("Vetor de documentos atualizado para a versão: " + receivedVersion);
+                        System.out.println("Vetor atual: " + documentCidVector);
+                    } else {
+                        System.out.println("Atualização ignorada (versão antiga ou igual). Versão recebida: " + receivedVersion + ", Versão atual: " + documentVectorVersion.get());
+                    }
+                }
+
+                // Armazenar embedding se presente (substitui o anterior)
+                if (embedding != null && !embedding.isEmpty()) {
+                    documentEmbeddings.put(cid, embedding);
+                    System.out.println("Embedding armazenado para CID: " + cid);
+                }
+
+            } catch (Exception e) {
+                System.err.println("Falha ao processar a atualização do documento: " + e.getMessage());
             }
         }
 
@@ -161,6 +244,7 @@ public class Libp2pPeer {
             while ((line = reader.readLine()) != null) {
                 sb.append(line);
             }
+            reader.close();
             return sb.toString();
         }
 
