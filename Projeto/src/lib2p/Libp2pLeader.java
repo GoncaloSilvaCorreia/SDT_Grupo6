@@ -75,7 +75,13 @@ public class Libp2pLeader {
         System.out.println("A espera de requisicoes...\n");
     }
 
+    private static void processNewDocument(String filepath) throws Exception {
+        // Delegate to the new tentative-processing method so existing calls continue to work
+        processNewDocumentTentative(filepath);
+    }
+
     /** Handler para upload de ficheiros */
+    // Substitui apenas a inner class UploadHandler no teu Libp2pLeader.java pela versão abaixo
     static class UploadHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
@@ -86,38 +92,42 @@ public class Libp2pLeader {
             }
             exchange.getResponseHeaders().add("Content-Type", "text/plain; charset=UTF-8");
 
-            if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                try {
-                    // Obter nome do ficheiro do header ou query parameter
-                    String filename = getFilename(exchange);
-                    if (filename == null || filename.isEmpty()) {
-                        filename = "ficheiro_" + System.currentTimeMillis();
-                    }
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Método não permitido");
+                return;
+            }
 
-                    // Ler conteúdo do ficheiro
-                    String sanitizedFilename = sanitizeFilename(filename);
-                    String filepath = UPLOAD_DIR + File.separator + sanitizedFilename;
-
-                    try (InputStream is = exchange.getRequestBody()) {
-                        Files.copy(is, Paths.get(filepath));
-                    }
-
-                    System.out.println("Ficheiro recebido: " + filename + " -> " + filepath);
-
-                    // Lógica de criação de uma nova versão PENDENTE do vetor de documentos
-                    processNewDocumentTentative(filepath);
-
-                    String response = "Ficheiro " + filename + " recebido e pendente de commit";
-                    sendResponse(exchange, 200, response);
-
-                } catch (Exception e) {
-                    System.err.println("Erro no upload: " + e.getMessage());
-                    e.printStackTrace();
-                    String error = "Erro no upload: " + e.getMessage();
-                    sendResponse(exchange, 500, error);
+            try {
+                // Obter nome do ficheiro do header ou query parameter
+                String filename = getFilename(exchange);
+                if (filename == null || filename.isEmpty()) {
+                    filename = "ficheiro_" + System.currentTimeMillis();
                 }
-            } else {
-                sendResponse(exchange, 405, "Metodo nao permitido");
+
+                String sanitizedFilename = sanitizeFilename(filename);
+                // Usa resolve para maior segurança e portabilidade
+                java.nio.file.Path targetDir = Paths.get(UPLOAD_DIR);
+                Files.createDirectories(targetDir); // garante existência
+                java.nio.file.Path targetPath = targetDir.resolve(sanitizedFilename);
+
+                // Escrever ficheiro no disco, sobrescrevendo se já existir
+                try (InputStream is = exchange.getRequestBody()) {
+                    Files.copy(is, targetPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                System.out.println("Ficheiro recebido: " + filename + " -> " + targetPath.toString());
+
+                // Lógica de atualização do vetor de documentos
+                processNewDocument(targetPath.toString());
+
+                String response = "Ficheiro " + filename + " enviado com sucesso e pendente de commit";
+                sendResponse(exchange, 200, response);
+
+            } catch (Exception e) {
+                // imprime stacktrace no servidor para debug
+                e.printStackTrace();
+                String error = "Erro no upload: " + e.getMessage();
+                sendResponse(exchange, 500, error);
             }
         }
 
@@ -134,6 +144,10 @@ public class Libp2pLeader {
         }
 
         private String sanitizeFilename(String filename) {
+            // remove caracteres perigosos e decodifica percent-encoded se necessário
+            try {
+                filename = java.net.URLDecoder.decode(filename, java.nio.charset.StandardCharsets.UTF_8.name());
+            } catch (Exception ignored) {}
             return filename.replaceAll("[^a-zA-Z0-9._-]", "_");
         }
     }
